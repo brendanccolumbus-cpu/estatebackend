@@ -1,7 +1,3 @@
-// EstateScout Backend - REAL DATA VERSION
-// Put this in GitHub at: api/sales.ts
-// Then Vercel will redeploy automatically.
-
 export default async function handler(req: any, res: any) {
   try {
     const lat = Number(req.query.lat || 34.05);
@@ -12,6 +8,10 @@ export default async function handler(req: any, res: any) {
     const place = await reverseGeocodeSafely(lat, lng);
     let sales: any[] = [];
 
+    if (source === "all" || source === "apify") {
+      sales.push(...await fetchApifySales(lat, lng, radius));
+    }
+
     if (source === "all" || source === "estatesalesnet") {
       sales.push(...await fetchEstateSalesNet(place, lat, lng, radius));
     }
@@ -20,7 +20,7 @@ export default async function handler(req: any, res: any) {
       sales.push(...await fetchEstateSalesOrg(place, lat, lng, radius));
     }
 
-    sales = removeDuplicates(sales).slice(0, 50);
+    sales = removeDuplicates(sales).slice(0, 60);
 
     if (sales.length === 0) {
       sales = fallbackSales(lat, lng);
@@ -29,8 +29,9 @@ export default async function handler(req: any, res: any) {
     return res.status(200).json({
       sales,
       meta: {
-        searchedNear: place,
+        app: "EState",
         source,
+        searchedNear: place,
         realResultsFound: sales.some((sale) => sale.sourceName !== "Test Data")
       }
     });
@@ -38,6 +39,7 @@ export default async function handler(req: any, res: any) {
     return res.status(200).json({
       sales: fallbackSales(Number(req.query.lat || 34.05), Number(req.query.lng || -118.25)),
       meta: {
+        app: "EState",
         realResultsFound: false,
         error: String(error?.message || error)
       }
@@ -45,17 +47,70 @@ export default async function handler(req: any, res: any) {
   }
 }
 
+async function fetchApifySales(lat: number, lng: number, radius: number) {
+  if (!process.env.APIFY_TOKEN || !process.env.APIFY_ACTOR_ID) return [];
+
+  try {
+    const actorId = encodeURIComponent(process.env.APIFY_ACTOR_ID);
+    const url = `https://api.apify.com/v2/acts/${actorId}/run-sync-get-dataset-items?token=${process.env.APIFY_TOKEN}&format=json`;
+
+    const input = {
+      query: `estate sales near ${lat},${lng}`,
+      latitude: lat,
+      longitude: lng,
+      radiusMiles: radius,
+      maxItems: 40
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(input)
+    });
+
+    if (!response.ok) return [];
+
+    const items = await response.json();
+
+    return (items || []).map((item: any, index: number) => {
+      const itemLat = Number(item.latitude || item.lat || item.location?.lat);
+      const itemLng = Number(item.longitude || item.lng || item.location?.lng);
+      const coord = nearbyCoordinate(lat, lng, index, radius);
+
+      return {
+        id: String(item.id || `apify-${index}`),
+        title: String(item.title || item.name || `Estate Sale ${index + 1}`),
+        address: String(item.address || item.location?.address || "Address on listing"),
+        city: String(item.city || item.location?.city || "Nearby"),
+        dateText: String(item.dateText || item.date || item.time || "See listing"),
+        distanceMiles: Number(item.distanceMiles || item.distance || index + 1),
+        latitude: Number.isFinite(itemLat) ? itemLat : coord.latitude,
+        longitude: Number.isFinite(itemLng) ? itemLng : coord.longitude,
+        sourceName: "Live Scraper",
+        sourceURLString: String(item.url || item.link || "https://apify.com")
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
 async function reverseGeocodeSafely(lat: number, lng: number) {
   try {
     const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&addressdetails=1`;
     const response = await fetch(url, {
-      headers: { "User-Agent": "EstateScout/1.0" }
+      headers: {
+        "User-Agent": "EState/1.0"
+      }
     });
 
     if (!response.ok) throw new Error("Reverse geocode failed");
 
     const json = await response.json();
     const address = json.address || {};
+
     const city = address.city || address.town || address.village || address.suburb || "Los Angeles";
     const state = address.state_code || stateNameToCode(address.state) || "CA";
     const zip = address.postcode || "90026";
@@ -80,7 +135,7 @@ async function fetchEstateSalesNet(place: any, lat: number, lng: number, radius:
   try {
     const url = `https://www.estatesales.net/${place.state}/${place.citySlug}/${place.zip}`;
     const html = await fetchText(url);
-    return parseRealishListings(html, "EstateSales.NET", url, place.city, lat, lng, radius);
+    return parsePublicListings(html, "EstateSales.NET", url, place.city, lat, lng, radius);
   } catch {
     return [];
   }
@@ -90,7 +145,7 @@ async function fetchEstateSalesOrg(place: any, lat: number, lng: number, radius:
   try {
     const url = `https://estatesales.org/estate-sales/${String(place.state).toLowerCase()}/${String(place.citySlug).toLowerCase()}/${place.zip}`;
     const html = await fetchText(url);
-    return parseRealishListings(html, "EstateSales.org", url, place.city, lat, lng, radius);
+    return parsePublicListings(html, "EstateSales.org", url, place.city, lat, lng, radius);
   } catch {
     return [];
   }
@@ -99,7 +154,7 @@ async function fetchEstateSalesOrg(place: any, lat: number, lng: number, radius:
 async function fetchText(url: string) {
   const response = await fetch(url, {
     headers: {
-      "User-Agent": "Mozilla/5.0 EstateScout/1.0",
+      "User-Agent": "Mozilla/5.0 EState/1.0",
       "Accept": "text/html"
     }
   });
@@ -108,7 +163,7 @@ async function fetchText(url: string) {
   return await response.text();
 }
 
-function parseRealishListings(
+function parsePublicListings(
   html: string,
   sourceName: string,
   sourceURLString: string,
@@ -117,24 +172,27 @@ function parseRealishListings(
   baseLng: number,
   radius: number
 ) {
-  const plain = html
+  const plainText = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, "\"")
     .replace(/\s+/g, " ")
     .trim();
 
-  const matches = plain.match(/.{0,80}(estate sale|moving sale|vintage|auction|sale).{0,180}/gi) || [];
+  const matches = plainText.match(/.{0,80}(estate sale|moving sale|vintage|auction|sale).{0,180}/gi) || [];
 
   return matches
     .map((text) => text.replace(/\s+/g, " ").trim())
     .filter((text) => text.length > 40)
     .filter((text) => !/cookie|privacy|terms|login|sign up|newsletter/i.test(text))
-    .slice(0, 20)
+    .slice(0, 25)
     .map((text, index) => {
       const coord = nearbyCoordinate(baseLat, baseLng, index, radius);
+
       return {
         id: `${sourceName}-${index}-${Date.now()}`,
         title: makeTitle(text, sourceName, index),
@@ -152,7 +210,11 @@ function parseRealishListings(
 
 function makeTitle(text: string, sourceName: string, index: number) {
   let title = text.split(" ").slice(0, 12).join(" ").trim();
-  if (!/sale|auction|estate/i.test(title)) title = `${sourceName} Listing ${index + 1}`;
+
+  if (!/sale|auction|estate/i.test(title)) {
+    title = `${sourceName} Listing ${index + 1}`;
+  }
+
   return title.length > 90 ? title.slice(0, 87) + "..." : title;
 }
 
@@ -173,7 +235,7 @@ function fallbackSales(lat: number, lng: number) {
       title: "Hollywood Estate Sale",
       address: "123 Sunset Blvd",
       city: "Los Angeles",
-      dateText: "Today 9AM–3PM",
+      dateText: "Today · 9 AM–3 PM",
       distanceMiles: 2.1,
       latitude: lat + 0.01,
       longitude: lng + 0.01,
@@ -185,7 +247,7 @@ function fallbackSales(lat: number, lng: number) {
       title: "Silver Lake Vintage Sale",
       address: "456 Hyperion Ave",
       city: "Silver Lake",
-      dateText: "Tomorrow 10AM–4PM",
+      dateText: "Tomorrow · 10 AM–4 PM",
       distanceMiles: 1.3,
       latitude: lat - 0.01,
       longitude: lng - 0.01,
@@ -198,6 +260,7 @@ function fallbackSales(lat: number, lng: number) {
 function nearbyCoordinate(lat: number, lng: number, index: number, radiusMiles: number) {
   const angle = index * 0.9;
   const distanceDegrees = Math.min(radiusMiles, 20) / 69 / 4 + index * 0.002;
+
   return {
     latitude: lat + Math.sin(angle) * distanceDegrees,
     longitude: lng + Math.cos(angle) * distanceDegrees
@@ -206,9 +269,12 @@ function nearbyCoordinate(lat: number, lng: number, index: number, radiusMiles: 
 
 function removeDuplicates(sales: any[]) {
   const seen = new Set();
+
   return sales.filter((sale) => {
-    const key = `${sale.title}-${sale.address}`.toLowerCase();
+    const key = `${sale.title}-${sale.address}`.toLowerCase().replace(/\s+/g, " ");
+
     if (seen.has(key)) return false;
+
     seen.add(key);
     return true;
   });
@@ -242,5 +308,6 @@ function stateNameToCode(stateName: string) {
     Connecticut: "CT",
     "New Jersey": "NJ"
   };
+
   return states[stateName] || "CA";
 }

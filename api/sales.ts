@@ -1,5 +1,5 @@
-module.exports = function handler(req, res) {
-  return res.status(200).json({
+export default function handler(req: any, res: any) {
+  res.status(200).json({
     sales: [
       {
         id: "1",
@@ -15,4 +15,4 @@ module.exports = function handler(req, res) {
       }
     ]
   });
-};
+}

@@ -1,3 +1,16 @@
+// EState Backend
+// File path: api/sales.ts
+// Vercel URL: https://estatebackend-orpin.vercel.app/api/sales
+//
+// Sources:
+// - Apify Actor: lulzasaur~estate-sales-scraper
+// - EstateSales.NET public page fallback
+// - EstateSales.org public page fallback
+//
+// Vercel Environment Variables:
+// APIFY_TOKEN = your Apify token
+// APIFY_ACTOR_ID = lulzasaur~estate-sales-scraper
+
 export default async function handler(req: any, res: any) {
   try {
     const lat = Number(req.query.lat || 34.05);
@@ -6,21 +19,27 @@ export default async function handler(req: any, res: any) {
     const source = String(req.query.source || "all").toLowerCase();
 
     const place = await reverseGeocodeSafely(lat, lng);
+
     let sales: any[] = [];
 
     if (source === "all" || source === "apify") {
-      sales.push(...await fetchApifySales(lat, lng, radius));
+      const apifySales = await fetchApifySales(place, lat, lng, radius);
+      sales.push(...apifySales);
     }
 
     if (source === "all" || source === "estatesalesnet") {
-      sales.push(...await fetchEstateSalesNet(place, lat, lng, radius));
+      const netSales = await fetchEstateSalesNet(place, lat, lng, radius);
+      sales.push(...netSales);
     }
 
     if (source === "all" || source === "estatesalesorg") {
-      sales.push(...await fetchEstateSalesOrg(place, lat, lng, radius));
+      const orgSales = await fetchEstateSalesOrg(place, lat, lng, radius);
+      sales.push(...orgSales);
     }
 
-    sales = removeDuplicates(sales).slice(0, 60);
+    sales = removeDuplicates(sales)
+      .filter((sale) => Number.isFinite(sale.latitude) && Number.isFinite(sale.longitude))
+      .slice(0, 60);
 
     if (sales.length === 0) {
       sales = fallbackSales(lat, lng);
@@ -47,19 +66,28 @@ export default async function handler(req: any, res: any) {
   }
 }
 
-async function fetchApifySales(lat: number, lng: number, radius: number) {
-  if (!process.env.APIFY_TOKEN || !process.env.APIFY_ACTOR_ID) return [];
+// MARK: - Apify Scraper
+
+async function fetchApifySales(place: any, lat: number, lng: number, radius: number) {
+  if (!process.env.APIFY_TOKEN || !process.env.APIFY_ACTOR_ID) {
+    return [];
+  }
 
   try {
     const actorId = encodeURIComponent(process.env.APIFY_ACTOR_ID);
-    const url = `https://api.apify.com/v2/acts/${actorId}/run-sync-get-dataset-items?token=${process.env.APIFY_TOKEN}&format=json`;
+
+    const url =
+      `https://api.apify.com/v2/acts/${actorId}/run-sync-get-dataset-items` +
+      `?token=${process.env.APIFY_TOKEN}&format=json`;
 
     const input = {
-      query: `estate sales near ${lat},${lng}`,
-      latitude: lat,
-      longitude: lng,
-      radiusMiles: radius,
-      maxItems: 40
+      zipCode: place.zip || "90026",
+      city: place.city || "",
+      state: place.state || "",
+      maxResults: 25,
+      proxyConfiguration: {
+        useApifyProxy: true
+      }
     };
 
     const response = await fetch(url, {
@@ -70,26 +98,73 @@ async function fetchApifySales(lat: number, lng: number, radius: number) {
       body: JSON.stringify(input)
     });
 
-    if (!response.ok) return [];
+    if (!response.ok) {
+      return [];
+    }
 
     const items = await response.json();
 
-    return (items || []).map((item: any, index: number) => {
-      const itemLat = Number(item.latitude || item.lat || item.location?.lat);
-      const itemLng = Number(item.longitude || item.lng || item.location?.lng);
+    if (!Array.isArray(items)) {
+      return [];
+    }
+
+    return items.map((item: any, index: number) => {
+      const itemLat = Number(
+        item.latitude ||
+        item.lat ||
+        item.location?.lat ||
+        item.geo?.lat
+      );
+
+      const itemLng = Number(
+        item.longitude ||
+        item.lng ||
+        item.location?.lng ||
+        item.geo?.lng
+      );
+
       const coord = nearbyCoordinate(lat, lng, index, radius);
 
       return {
-        id: String(item.id || `apify-${index}`),
-        title: String(item.title || item.name || `Estate Sale ${index + 1}`),
-        address: String(item.address || item.location?.address || "Address on listing"),
-        city: String(item.city || item.location?.city || "Nearby"),
-        dateText: String(item.dateText || item.date || item.time || "See listing"),
+        id: String(item.id || item.url || item.link || `apify-${index}`),
+        title: cleanText(
+          item.title ||
+          item.name ||
+          item.saleTitle ||
+          item.eventTitle ||
+          `Estate Sale ${index + 1}`
+        ),
+        address: cleanText(
+          item.address ||
+          item.streetAddress ||
+          item.location?.address ||
+          item.fullAddress ||
+          "Address on listing"
+        ),
+        city: cleanText(
+          item.city ||
+          item.location?.city ||
+          place.city ||
+          "Nearby"
+        ),
+        dateText: cleanText(
+          item.dateText ||
+          item.dates ||
+          item.date ||
+          item.startDate ||
+          item.saleDate ||
+          "See listing"
+        ),
         distanceMiles: Number(item.distanceMiles || item.distance || index + 1),
         latitude: Number.isFinite(itemLat) ? itemLat : coord.latitude,
         longitude: Number.isFinite(itemLng) ? itemLng : coord.longitude,
         sourceName: "Live Scraper",
-        sourceURLString: String(item.url || item.link || "https://apify.com")
+        sourceURLString: String(
+          item.url ||
+          item.link ||
+          item.sourceURL ||
+          "https://www.estatesales.net/"
+        )
       };
     });
   } catch {
@@ -97,45 +172,22 @@ async function fetchApifySales(lat: number, lng: number, radius: number) {
   }
 }
 
-async function reverseGeocodeSafely(lat: number, lng: number) {
-  try {
-    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&addressdetails=1`;
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": "EState/1.0"
-      }
-    });
-
-    if (!response.ok) throw new Error("Reverse geocode failed");
-
-    const json = await response.json();
-    const address = json.address || {};
-
-    const city = address.city || address.town || address.village || address.suburb || "Los Angeles";
-    const state = address.state_code || stateNameToCode(address.state) || "CA";
-    const zip = address.postcode || "90026";
-
-    return {
-      city,
-      citySlug: slugCity(city),
-      state,
-      zip
-    };
-  } catch {
-    return {
-      city: "Los Angeles",
-      citySlug: "Los-Angeles",
-      state: "CA",
-      zip: "90026"
-    };
-  }
-}
+// MARK: - Public Source Fallbacks
 
 async function fetchEstateSalesNet(place: any, lat: number, lng: number, radius: number) {
   try {
     const url = `https://www.estatesales.net/${place.state}/${place.citySlug}/${place.zip}`;
-    const html = await fetchText(url);
-    return parsePublicListings(html, "EstateSales.NET", url, place.city, lat, lng, radius);
+    const html = await fetchHTML(url);
+
+    return parsePublicListings({
+      html,
+      sourceName: "EstateSales.NET",
+      sourceURLString: url,
+      city: place.city,
+      baseLat: lat,
+      baseLng: lng,
+      radius
+    });
   } catch {
     return [];
   }
@@ -143,15 +195,29 @@ async function fetchEstateSalesNet(place: any, lat: number, lng: number, radius:
 
 async function fetchEstateSalesOrg(place: any, lat: number, lng: number, radius: number) {
   try {
-    const url = `https://estatesales.org/estate-sales/${String(place.state).toLowerCase()}/${String(place.citySlug).toLowerCase()}/${place.zip}`;
-    const html = await fetchText(url);
-    return parsePublicListings(html, "EstateSales.org", url, place.city, lat, lng, radius);
+    const url =
+      `https://estatesales.org/estate-sales/` +
+      `${String(place.state).toLowerCase()}/` +
+      `${String(place.citySlug).toLowerCase()}/` +
+      `${place.zip}`;
+
+    const html = await fetchHTML(url);
+
+    return parsePublicListings({
+      html,
+      sourceName: "EstateSales.org",
+      sourceURLString: url,
+      city: place.city,
+      baseLat: lat,
+      baseLng: lng,
+      radius
+    });
   } catch {
     return [];
   }
 }
 
-async function fetchText(url: string) {
+async function fetchHTML(url: string) {
   const response = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 EState/1.0",
@@ -159,36 +225,41 @@ async function fetchText(url: string) {
     }
   });
 
-  if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+  if (!response.ok) {
+    throw new Error(`Fetch failed ${response.status}: ${url}`);
+  }
+
   return await response.text();
 }
 
-function parsePublicListings(
-  html: string,
-  sourceName: string,
-  sourceURLString: string,
-  city: string,
-  baseLat: number,
-  baseLng: number,
-  radius: number
-) {
-  const plainText = html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, "\"")
-    .replace(/\s+/g, " ")
-    .trim();
+function parsePublicListings(args: {
+  html: string;
+  sourceName: string;
+  sourceURLString: string;
+  city: string;
+  baseLat: number;
+  baseLng: number;
+  radius: number;
+}) {
+  const {
+    html,
+    sourceName,
+    sourceURLString,
+    city,
+    baseLat,
+    baseLng,
+    radius
+  } = args;
 
-  const matches = plainText.match(/.{0,80}(estate sale|moving sale|vintage|auction|sale).{0,180}/gi) || [];
+  const plainText = stripHTML(html);
+
+  const matches =
+    plainText.match(/.{0,80}(estate sale|moving sale|garage sale|vintage|auction|sale).{0,180}/gi) || [];
 
   return matches
-    .map((text) => text.replace(/\s+/g, " ").trim())
+    .map((text) => cleanText(text))
     .filter((text) => text.length > 40)
-    .filter((text) => !/cookie|privacy|terms|login|sign up|newsletter/i.test(text))
+    .filter((text) => !/cookie|privacy|terms|login|sign up|newsletter|javascript/i.test(text))
     .slice(0, 25)
     .map((text, index) => {
       const coord = nearbyCoordinate(baseLat, baseLng, index, radius);
@@ -208,8 +279,68 @@ function parsePublicListings(
     });
 }
 
+// MARK: - Location
+
+async function reverseGeocodeSafely(lat: number, lng: number) {
+  try {
+    const url =
+      `https://nominatim.openstreetmap.org/reverse` +
+      `?format=jsonv2&lat=${lat}&lon=${lng}&addressdetails=1`;
+
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "EState/1.0"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error("Reverse geocode failed");
+    }
+
+    const json = await response.json();
+    const address = json.address || {};
+
+    const city =
+      address.city ||
+      address.town ||
+      address.village ||
+      address.suburb ||
+      address.county ||
+      "Los Angeles";
+
+    const state =
+      address.state_code ||
+      stateNameToCode(address.state) ||
+      "CA";
+
+    const zip =
+      address.postcode ||
+      "90026";
+
+    return {
+      city,
+      citySlug: slugCity(city),
+      state,
+      zip
+    };
+  } catch {
+    return {
+      city: "Los Angeles",
+      citySlug: "Los-Angeles",
+      state: "CA",
+      zip: "90026"
+    };
+  }
+}
+
+// MARK: - Helpers
+
 function makeTitle(text: string, sourceName: string, index: number) {
-  let title = text.split(" ").slice(0, 12).join(" ").trim();
+  let title = cleanText(text)
+    .split(" ")
+    .slice(0, 12)
+    .join(" ")
+    .trim();
 
   if (!/sale|auction|estate/i.test(title)) {
     title = `${sourceName} Listing ${index + 1}`;
@@ -219,13 +350,132 @@ function makeTitle(text: string, sourceName: string, index: number) {
 }
 
 function makeAddress(text: string) {
-  const match = text.match(/\d{2,6}\s+[a-z0-9 .#-]+\s+(ave|avenue|st|street|blvd|boulevard|dr|drive|rd|road|ln|lane|way|ct|court|pl|place)/i);
-  return match ? match[0].trim() : "Address on source listing";
+  const match = text.match(
+    /\d{2,6}\s+[a-z0-9 .#-]+\s+(ave|avenue|st|street|blvd|boulevard|dr|drive|rd|road|ln|lane|way|ct|court|pl|place)/i
+  );
+
+  return match ? cleanText(match[0]) : "Address on source listing";
 }
 
 function makeDateText(text: string) {
-  const match = text.match(/(today|tomorrow|friday|saturday|sunday|monday|tuesday|wednesday|thursday|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[^.!?]{0,80}/i);
-  return match ? match[0].trim() : "See listing for dates";
+  const match = text.match(
+    /(today|tomorrow|friday|saturday|sunday|monday|tuesday|wednesday|thursday|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[^.!?]{0,80}/i
+  );
+
+  return match ? cleanText(match[0]) : "See listing for dates";
+}
+
+function nearbyCoordinate(lat: number, lng: number, index: number, radiusMiles: number) {
+  const angle = index * 0.9;
+  const distanceDegrees = Math.min(radiusMiles, 20) / 69 / 4 + index * 0.002;
+
+  return {
+    latitude: lat + Math.sin(angle) * distanceDegrees,
+    longitude: lng + Math.cos(angle) * distanceDegrees
+  };
+}
+
+function removeDuplicates(sales: any[]) {
+  const seen = new Set();
+
+  return sales.filter((sale) => {
+    const key = `${sale.title}-${sale.address}`.toLowerCase().replace(/\s+/g, " ");
+
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function stripHTML(html: string) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, "\"")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanText(value: any) {
+  return String(value || "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, "\"")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function slugCity(city: string) {
+  return String(city || "Los Angeles")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-|-$/g, "") || "Los-Angeles";
+}
+
+function stateNameToCode(stateName: string) {
+  const states: Record<string, string> = {
+    Alabama: "AL",
+    Alaska: "AK",
+    Arizona: "AZ",
+    Arkansas: "AR",
+    California: "CA",
+    Colorado: "CO",
+    Connecticut: "CT",
+    Delaware: "DE",
+    Florida: "FL",
+    Georgia: "GA",
+    Hawaii: "HI",
+    Idaho: "ID",
+    Illinois: "IL",
+    Indiana: "IN",
+    Iowa: "IA",
+    Kansas: "KS",
+    Kentucky: "KY",
+    Louisiana: "LA",
+    Maine: "ME",
+    Maryland: "MD",
+    Massachusetts: "MA",
+    Michigan: "MI",
+    Minnesota: "MN",
+    Mississippi: "MS",
+    Missouri: "MO",
+    Montana: "MT",
+    Nebraska: "NE",
+    Nevada: "NV",
+    "New Hampshire": "NH",
+    "New Jersey": "NJ",
+    "New Mexico": "NM",
+    "New York": "NY",
+    "North Carolina": "NC",
+    "North Dakota": "ND",
+    Ohio: "OH",
+    Oklahoma: "OK",
+    Oregon: "OR",
+    Pennsylvania: "PA",
+    "Rhode Island": "RI",
+    "South Carolina": "SC",
+    "South Dakota": "SD",
+    Tennessee: "TN",
+    Texas: "TX",
+    Utah: "UT",
+    Vermont: "VT",
+    Virginia: "VA",
+    Washington: "WA",
+    "West Virginia": "WV",
+    Wisconsin: "WI",
+    Wyoming: "WY"
+  };
+
+  return states[stateName] || "CA";
 }
 
 function fallbackSales(lat: number, lng: number) {
@@ -255,59 +505,4 @@ function fallbackSales(lat: number, lng: number) {
       sourceURLString: "https://example.com"
     }
   ];
-}
-
-function nearbyCoordinate(lat: number, lng: number, index: number, radiusMiles: number) {
-  const angle = index * 0.9;
-  const distanceDegrees = Math.min(radiusMiles, 20) / 69 / 4 + index * 0.002;
-
-  return {
-    latitude: lat + Math.sin(angle) * distanceDegrees,
-    longitude: lng + Math.cos(angle) * distanceDegrees
-  };
-}
-
-function removeDuplicates(sales: any[]) {
-  const seen = new Set();
-
-  return sales.filter((sale) => {
-    const key = `${sale.title}-${sale.address}`.toLowerCase().replace(/\s+/g, " ");
-
-    if (seen.has(key)) return false;
-
-    seen.add(key);
-    return true;
-  });
-}
-
-function slugCity(city: string) {
-  return String(city || "Los Angeles")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-zA-Z0-9]+/g, "-")
-    .replace(/^-|-$/g, "") || "Los-Angeles";
-}
-
-function stateNameToCode(stateName: string) {
-  const states: Record<string, string> = {
-    California: "CA",
-    "New York": "NY",
-    Texas: "TX",
-    Florida: "FL",
-    Illinois: "IL",
-    Pennsylvania: "PA",
-    Ohio: "OH",
-    Georgia: "GA",
-    Michigan: "MI",
-    Washington: "WA",
-    Oregon: "OR",
-    Nevada: "NV",
-    Arizona: "AZ",
-    Colorado: "CO",
-    Massachusetts: "MA",
-    Connecticut: "CT",
-    "New Jersey": "NJ"
-  };
-
-  return states[stateName] || "CA";
 }
